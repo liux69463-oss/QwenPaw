@@ -1,0 +1,39 @@
+# QwenPaw URL Guard - 默认 URL 访问规则
+# 这些规则在 URLGuard 启用时自动加载
+
+- id: URL_BLOCK_PRIVATE_NETWORK
+  category: network_abuse
+  severity: HIGH
+  blocked_patterns:
+    - "^https?://(10\\.|172\\.(1[6-9]|2[0-9]|3[01])\\.|192\\.168\\.|127\\.).*"
+    - "^https?://localhost.*"
+    - "^https?://0\\.0\\.0\\.0.*"
+  description: "阻止访问内网/本地地址（SSRF 防护）"
+  remediation: "使用公网地址或确认访问内网是预期行为后添加白名单"
+
+- id: URL_BLOCK_SHELL_CODE_HOSTING
+  category: command_injection
+  severity: CRITICAL
+  blocked_patterns:
+    - "^https?://[^/]*pastebin\\.com(?:/|$)"
+    - "^https?://[^/]*raw\\.githubusercontent\\.com/.+\\.(?:sh|bash|py|rb|pl|go|js|php|ps1)(?:\\?.*)?$"
+    - "^https?://[^/]*gist\\.githubusercontent\\.com/.+\\.(?:sh|bash|py|rb|pl|go|js|php|ps1)(?:\\?.*)?$"
+    - "^https?://[^/]*gitlab\\.com/[^/]+/[^/]+/-/raw/.+\\.(?:sh|bash|py|rb|pl|go|js|php|ps1)(?:\\?.*)?$"
+  description: "阻止从代码托管站点直接下载可执行脚本（命令注入风险）"
+  remediation: "先下载到本地文件，检查内容后再执行"
+
+- id: URL_BLOCK_KNOWN_MALWARE
+  category: network_abuse
+  severity: CRITICAL
+  blocked_domains: []
+  blocked_patterns: []
+  description: "阻止已知恶意域名（默认为空，用户可自行添加）"
+  remediation: "在 config.json 的 security.url_guard.blocked_domains 中添加恶意域名"
+
+- id: URL_BLOCK_CSDN
+  category: network_abuse
+  severity: HIGH
+  blocked_patterns:
+    - "^https?://[^/]*csdn\\.net(?:/|$)"
+  description: "拦截 CSDN 所有子域名"
+  remediation: "如需访问请添加白名单"

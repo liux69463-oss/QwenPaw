@@ -323,6 +323,102 @@ def _check_shell_danger_keywords(command: str) -> Optional[str]:
 
 
 # ---------------------------------------------------------------------------
+# URL blocking for network/shell tools (Browser, curl, wget, etc.)
+# ---------------------------------------------------------------------------
+
+_URL_PATTERN_RE = re.compile(r"https?://\S+", re.IGNORECASE)
+
+# Shell-command-specific URL extraction patterns (migrated from
+# URLToolGuardian).  These match curl/wget/nc more precisely than
+# the generic _URL_PATTERN_RE and handle flags between the command
+# name and the URL argument (e.g. ``curl -X POST https://...``).
+_SHELL_URL_PATTERNS: list[re.Pattern[str]] = [
+    re.compile(r"curl\s+.*?(https?://[^\s'\"<>|;&]+)", re.IGNORECASE),
+    re.compile(r"wget\s+.*?(https?://[^\s'\"<>|;&]+)", re.IGNORECASE),
+    re.compile(r"nc\s+.*?\s(https?://[^\s'\"<>|;&]+)", re.IGNORECASE),
+]
+
+
+def _extract_urls(
+    target: str,
+    tool_type: str = "",
+) -> list[str]:
+    """Extract all unique URLs from target text.
+
+    :param target: The tool's target string (e.g. shell command, URL, body).
+    :param tool_type: ``"shell"`` triggers additional shell-command patterns.
+    :returns: Deduplicated list of URL strings (order-preserving).
+    """
+    seen: set[str] = set()
+    urls: list[str] = []
+
+    def _add(u: str) -> None:
+        u = u.rstrip(",.;:!?)]}'\"")
+        if u not in seen:
+            seen.add(u)
+            urls.append(u)
+
+    # Generic https?:// catch-all
+    for m in _URL_PATTERN_RE.findall(target):
+        _add(m)
+
+    # Shell-specific patterns (curl / wget / nc)
+    if tool_type == "shell":
+        for pattern in _SHELL_URL_PATTERNS:
+            for m in pattern.findall(target):
+                _add(m)
+
+    return urls
+
+
+def _check_urls_with_engine(
+    target: str,
+    engine: Any,
+    tool_type: str = "",
+    raw_params: dict[str, Any] | None = None,
+) -> Optional[str]:
+    """Extract URLs from target text (and raw_params) and check each
+    via URLRuleEngine.
+
+    Delegates to the shared URLRuleEngine (same instance used by the
+    ToolGuard path) so that YAML rules, config.json settings, and all
+    rule types (domain, pattern, wildcard, private-IP) are evaluated
+    consistently.
+
+    :param target: Primary target string (tool's main argument).
+    :param engine: URLRuleEngine instance.
+    :param tool_type: ``"shell"`` enables shell-specific URL extraction.
+    :param raw_params: Optional raw tool parameters for multi-parameter
+                       scanning (defense-in-depth against URLs in
+                       auxiliary arguments).
+
+    Returns the block reason string if any URL is blocked,
+    ``None`` if all URLs pass.
+    """
+    # ── Primary: extract URLs from target ── 这里应该用set？
+    urls = _extract_urls(target, tool_type=tool_type)
+
+    # ── Secondary: scan raw_params for URLs in auxiliary arguments ──
+    if raw_params:
+        for key, value in raw_params.items():
+            # Skip params already covered by target extraction (the
+            # registry maps known param names → target).
+            if not isinstance(value, str):
+                continue
+            urls.extend(_extract_urls(value, tool_type=""))
+
+    if not urls:
+        return None
+
+    for url in urls:
+        result = engine.check_url(url)
+        if result.is_blocked:
+            return result.reason
+
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Default sandbox deny_paths — paths forbidden for sandbox processes
 # ---------------------------------------------------------------------------
 
@@ -532,6 +628,17 @@ class GovernancePolicy:
     shell_evasion_checks: dict[str, bool] = field(default_factory=dict)
     detection_rules: List[DetectionRuleConfig] = field(default_factory=list)
 
+    # URL blocking: regex patterns for network-type tool URL filtering
+    url_blocked_patterns: List[str] = field(default_factory=list)
+    url_blocked_domains: List[str] = field(default_factory=list)
+    url_allowed_domains: List[str] = field(default_factory=list)
+
+    # Shared URLRuleEngine instance injected by ResourceGovernor.
+    # When set, Phase 1.6 delegates to this engine for consistent
+    # URL blocking (shared with the ToolGuard path).  None = fallback
+    # to list-based checks or skip.
+    _url_rule_engine: Any = field(default=None, repr=False, compare=False)
+
     # Internal reference to registry (defaults to module-level
     # DEFAULT_REGISTRY)
     _registry: ToolRegistry = field(
@@ -616,6 +723,45 @@ class GovernancePolicy:
                     action=GovernanceAction.DENY,
                     reason=danger_reason,
                     findings=findings,
+                )
+
+        # ── Phase 1.6: URL blocking (network + shell tools) ──
+        # Check the URL target against blocked patterns/domains before
+        # the Browser(**) → ALLOW rule fires in Phase 2.
+        # Also covers shell commands that contain URLs (curl, wget, etc.).
+        # Delegates to URLRuleEngine (shared with ToolGuard path) for
+        # consistent rule evaluation including YAML rules + config.json.
+        # v2.1: also scans raw_params for URLs in auxiliary arguments
+        # (defense-in-depth) and uses shell-specific patterns for shell
+        # commands (migrated from URLToolGuardian).
+        if tool_type in ("network", "shell"):
+            engine = getattr(self, '_url_rule_engine', None)
+            if engine is not None:
+                url_block_reason = _check_urls_with_engine(
+                    tc_spec.target, engine,
+                    tool_type=tool_type,
+                    raw_params=tc_spec.raw_params,
+                )
+                if url_block_reason:
+                    logger.info(
+                        "Phase 1.6 BLOCKED: tool=%s target=%s reason=%s",
+                        tc_spec.tool_name, tc_spec.target, url_block_reason,
+                    )
+                    return GovernanceDecision(
+                        action=GovernanceAction.DENY,
+                        reason=url_block_reason,
+                        findings=findings,
+                        source="url-blacklist",
+                    )
+                logger.debug(
+                    "Phase 1.6 PASS: tool=%s target=%s — URL not blocked",
+                    tc_spec.tool_name, tc_spec.target,
+                )
+            else:
+                logger.warning(
+                    "Phase 1.6 SKIPPED: _url_rule_engine is None — "
+                    "tool=%s target=%s passed WITHOUT URL check",
+                    tc_spec.tool_name, tc_spec.target,
                 )
 
         # ── Phase 2: builtin_rules + user_rules (first-match-wins) ──
@@ -979,6 +1125,17 @@ def load_governance_policy(
         data.get("detection_rules", []),
     )
 
+    # ── URL blocking config ──
+    url_blocked_patterns = data.get("url_blocked_patterns", [])
+    if not isinstance(url_blocked_patterns, list):
+        url_blocked_patterns = []
+    url_blocked_domains = data.get("url_blocked_domains", [])
+    if not isinstance(url_blocked_domains, list):
+        url_blocked_domains = []
+    url_allowed_domains = data.get("url_allowed_domains", [])
+    if not isinstance(url_allowed_domains, list):
+        url_allowed_domains = []
+
     # ── Replace WORKSPACE_DIR with actual path ──
     if workspace_dir:
         _resolve_workspace_dir(builtin_rules, workspace_dir)
@@ -994,6 +1151,9 @@ def load_governance_policy(
         sensitive_paths=sensitive_paths,
         shell_evasion_checks=shell_evasion_checks,
         detection_rules=detection_rules,
+        url_blocked_patterns=url_blocked_patterns,
+        url_blocked_domains=url_blocked_domains,
+        url_allowed_domains=url_allowed_domains,
     )
 
 
@@ -1098,6 +1258,9 @@ def _create_default_policy(workspace_dir: str = "") -> GovernancePolicy:
         execution_level="smart",
         sensitive_paths=list(_DEFAULT_SENSITIVE_PATHS),
         shell_evasion_checks=dict(_DEFAULT_SHELL_EVASION_CHECKS),
+        url_blocked_patterns=[],
+        url_blocked_domains=[],
+        url_allowed_domains=[],
     )
 
 

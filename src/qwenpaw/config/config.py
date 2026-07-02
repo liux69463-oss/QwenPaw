@@ -1908,6 +1908,23 @@ class SkillScannerConfig(BaseModel):
     )
 
 
+class UrlGuardConfig(BaseModel):
+    """URL guard settings under ``security.url_guard``.
+
+    Controls the URL-level security interceptor that blocks malicious
+    or suspicious URLs before they are accessed (both via tool-call
+    parameters and HTTP library monkey-patch).
+    """
+
+    enabled: bool = True
+    blocked_domains: List[str] = Field(default_factory=list)
+    blocked_patterns: List[str] = Field(default_factory=list)
+    allowed_domains: List[str] = Field(default_factory=list)
+    custom_rules: List[Dict[str, Any]] = Field(default_factory=list)
+    log_blocked: bool = True
+    block_message: str = "访问被安全策略拦截：{url}（原因：{reason}）"
+
+
 class SecurityConfig(BaseModel):
     """Top-level ``security`` section in config.json."""
 
@@ -1916,6 +1933,7 @@ class SecurityConfig(BaseModel):
     skill_scanner: SkillScannerConfig = Field(
         default_factory=SkillScannerConfig,
     )
+    url_guard: UrlGuardConfig = Field(default_factory=UrlGuardConfig)
     allow_no_auth_hosts: List[str] = Field(
         default_factory=lambda: ["127.0.0.1", "::1"],
         description=(

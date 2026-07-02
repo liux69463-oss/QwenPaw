@@ -10,7 +10,7 @@ from __future__ import annotations
 import hashlib
 import logging
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 from .policy import (
     GovernancePolicy,
@@ -47,6 +47,8 @@ class ResourceGovernor:
         2. Audit logging: audit(tool_call, decision) records an audit log entry
         3. Sandbox config compilation: compile_sandbox_config() → SandboxConfig
         4. Dynamic rule addition: add_rule(...) after user approval
+        5. HTTP Library Monkey-Patch: install URLNetGuard to intercept
+           HTTP calls at the library level (defense-in-depth)
 
     NOT responsible for (TBD):
         - sandbox creation/destruction → managed by orchestration layer
@@ -77,6 +79,8 @@ class ResourceGovernor:
         self._policy: Optional[GovernancePolicy] = None
         self._sandbox_available: bool = False
         self._sandbox_capability: Optional[SandboxCapability] = None
+        # URLNetGuard — HTTP library monkey-patch (defense-in-depth)
+        self._url_net_guard: Any = None
 
     # ------------------------------------------------------------------
     # Lifecycle (kept but not expanded, overlaps with runtime)
@@ -95,13 +99,36 @@ class ResourceGovernor:
         """Probe result from start() (SandboxCapability)."""
         return self._sandbox_capability
 
+    @property
+    def proxy_url(self) -> Optional[str]:
+        """返回 URL 过滤代理地址（供 shell.py 注入子进程环境变量）。
+
+        仅在 URLNetGuard 安装后可用。无代理时返回 None。
+        """
+        if self._url_net_guard is not None:
+            return self._url_net_guard.proxy_url
+        return None
+
     def start(self) -> None:
-        """Load policy and probe sandbox capabilities."""
+        """Load policy, probe sandbox capabilities, and install
+        HTTP library monkey-patch (URLNetGuard).
+        """
         self._policy_dir.mkdir(parents=True, exist_ok=True)
         self._policy = load_governance_policy(
             str(self._policy_dir),
             str(self.workspace_dir),
         )
+
+        # Inject URL blocking settings from global config.json so that
+        # all network-type tools (Browser, web_fetch, etc.) are checked
+        # against the same blocked patterns/domains as ToolGuardEngine.
+        self._load_url_blocked_config()
+
+        # ── Install HTTP library monkey-patch (URLNetGuard) ──
+        # This intercepts requests/httpx/urllib/aiohttp calls at the
+        # library level, catching URLs constructed inside tool function
+        # bodies that are invisible to parameter-based scanning.
+        self._install_url_net_guard()
 
         self._sandbox_capability = probe_sandbox_support()
         self._sandbox_available = self._sandbox_capability.supported
@@ -113,7 +140,9 @@ class ResourceGovernor:
             )
 
     def stop(self) -> None:
-        """Persist policy (if modified) and close the audit log."""
+        """Persist policy (if modified), uninstall URLNetGuard,
+        and close the audit log.
+        """
         if self._policy and self._policy.rules:
             try:
                 save_governance_policy(
@@ -125,6 +154,8 @@ class ResourceGovernor:
                 logger.exception(
                     "ResourceGovernor.stop: failed to persist policy.yaml",
                 )
+        # Uninstall HTTP library monkey-patch (restore original methods)
+        self._uninstall_url_net_guard()
         # Close the global AuditLog: triggers the deferred VACUUM and
         # releases the SQLite handle. Without this, audit.db is only
         # closed on interpreter exit (best-effort) which is fragile
@@ -135,6 +166,127 @@ class ResourceGovernor:
             logger.exception(
                 "ResourceGovernor.stop: failed to close AuditLog",
             )
+
+    # ------------------------------------------------------------------
+    # Core interface 1: Policy evaluation
+    # ------------------------------------------------------------------
+
+    def _load_url_blocked_config(self) -> None:
+        """Load URL blocking config from global config.json and inject
+        a URLRuleEngine into the loaded GovernancePolicy.
+
+        Reads ``security.url_guard`` section for:
+        - blocked_patterns (regex patterns)
+        - blocked_domains (exact domain matches)
+        - allowed_domains (whitelist bypasses)
+
+        Merges YAML-sourced values (policy.yaml) with config.json values
+        and creates a shared URLRuleEngine that is used by Phase 1.6 in
+        GovernancePolicy.evaluate().
+        """
+        if self._policy is None:
+            return
+        try:
+            from ..config import load_config
+            from ..security.tool_guard.url_guard.url_rule_engine import (
+                URLRuleEngine,
+            )
+
+            cfg = load_config()
+            url_cfg = cfg.security.url_guard
+
+            # Merge YAML-sourced values with config.json values
+            bp = list(self._policy.url_blocked_patterns or [])
+            bd = list(self._policy.url_blocked_domains or [])
+            ad = list(self._policy.url_allowed_domains or [])
+
+            bp.extend(url_cfg.blocked_patterns or [])
+            bd.extend(url_cfg.blocked_domains or [])
+            ad.extend(url_cfg.allowed_domains or [])
+
+            # Also keep merged lists for YAML round-trip compatibility
+            self._policy.url_blocked_patterns = bp
+            self._policy.url_blocked_domains = bd
+            self._policy.url_allowed_domains = ad
+
+            # Create a shared URLRuleEngine (no YAML rules file needed;
+            # we rely on config.json + policy.yaml only for governance)
+            engine = URLRuleEngine(
+                rules_file=None,
+                blocked_domains=bd,
+                blocked_patterns=bp,
+                allowed_domains=ad,
+            )
+            self._policy._url_rule_engine = engine
+            logger.info(
+                "ResourceGovernor: URLRuleEngine LOADED — "
+                "Phase 1.6 URL blocking is ACTIVE "
+                "(rules=%d, blocked_domains=%d, blocked_patterns=%d, "
+                "allowed_domains=%d)",
+                engine.rule_count,
+                len(bd),
+                len(bp),
+                len(ad),
+            )
+        except Exception:
+            logger.error(
+                "ResourceGovernor: URLRuleEngine FAILED to load — "
+                "Phase 1.6 URL blocking is DISABLED. "
+                "No URL will be intercepted at the policy level.",
+                exc_info=True,
+            )
+
+    def _install_url_net_guard(self) -> None:
+        """Install HTTP library monkey-patch (URLNetGuard).
+
+        Intercepts requests/httpx/urllib/aiohttp calls at the library
+        level, catching URLs constructed inside tool function bodies
+        that are invisible to Phase 1.6 parameter-based scanning.
+
+        Uses the same URLRuleEngine instance shared with Phase 1.6 so
+        that all URL blocking rules (YAML + config.json) are applied
+        consistently.
+        """
+        if self._policy is None:
+            return
+        engine = getattr(self._policy, '_url_rule_engine', None)
+        if engine is None:
+            return
+        try:
+            from ..security.tool_guard.url_guard.url_net_guard import (
+                URLNetGuard,
+            )
+
+            self._url_net_guard = URLNetGuard(engine)
+            self._url_net_guard.install()
+            proxy_info = ""
+            if self._url_net_guard.proxy_url:
+                proxy_info = f"（代理: {self._url_net_guard.proxy_url}）"
+            logger.info(
+                "ResourceGovernor: URLNetGuard monkey-patch installed — "
+                "HTTP library calls will be intercepted for URL safety%s",
+                proxy_info,
+            )
+        except Exception:
+            logger.debug(
+                "ResourceGovernor: URLNetGuard install skipped "
+                "(may be missing optional HTTP libraries)",
+            )
+
+    def _uninstall_url_net_guard(self) -> None:
+        """Uninstall HTTP library monkey-patch, restoring original methods."""
+        if self._url_net_guard is not None:
+            try:
+                self._url_net_guard.uninstall()
+                logger.info(
+                    "ResourceGovernor: URLNetGuard monkey-patch uninstalled",
+                )
+            except Exception:
+                logger.exception(
+                    "ResourceGovernor: URLNetGuard uninstall failed",
+                )
+            finally:
+                self._url_net_guard = None
 
     # ------------------------------------------------------------------
     # Core interface 1: Policy evaluation

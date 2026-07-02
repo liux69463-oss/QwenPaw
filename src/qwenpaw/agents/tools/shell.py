@@ -446,6 +446,45 @@ def _is_dangerous_self_kill(cmd: str) -> bool:
     return False
 
 
+# ---------------------------------------------------------------------------
+# URL 过滤代理注入 — 让 Bash 子进程的 HTTP 请求经过代理审查
+# ---------------------------------------------------------------------------
+
+
+def _get_url_proxy_env_vars() -> dict[str, str]:
+    """获取 URL 过滤代理环境变量。
+
+    从 url_proxy 全局注册表获取当前活跃的代理 URL，
+    返回需要注入子进程的 HTTP_PROXY / HTTPS_PROXY / NO_PROXY 字典。
+    不修改 os.environ，避免污染当前进程（影响 openai SDK 等上游调用）。
+
+    NO_PROXY 排除 127.0.0.1 / localhost / ::1，避免代理回环
+    （Playwright CDP、健康检查等基础设施调用不应走代理）。
+    """
+    try:
+        from qwenpaw.security.tool_guard.url_guard.url_proxy import (
+            get_active_proxy_url,
+        )
+        proxy_url = get_active_proxy_url()
+        if proxy_url:
+            import logging as _logging
+            _log = _logging.getLogger(__name__)
+            _log.info(
+                "已获取 URL 过滤代理地址: %s", proxy_url,
+            )
+            return {
+                "HTTP_PROXY": proxy_url,
+                "HTTPS_PROXY": proxy_url,
+                "http_proxy": proxy_url,
+                "https_proxy": proxy_url,
+                "NO_PROXY": "127.0.0.1,localhost,::1,0.0.0.0",
+            }
+    except Exception:
+        # 兜底：导入失败或代理未就绪时静默跳过
+        pass
+    return {}
+
+
 # pylint: disable=too-many-branches, too-many-statements
 @tool_descriptor(requires_sandbox=("shell_exec",), async_execution=True)
 async def execute_shell_command(
@@ -530,6 +569,15 @@ async def execute_shell_command(
         env["PATH"] = python_bin_dir + os.pathsep + existing_path
     else:
         env["PATH"] = python_bin_dir
+
+    # Inject URL filter proxy for subprocess HTTP interception
+    # 注入到 env 字典（非 sandbox 路径）和 sandbox_config.env_vars
+    # （sandbox 通过 config.env_vars 传递给子进程，不污染当前 os.environ）
+    proxy_env_vars = _get_url_proxy_env_vars()
+    if proxy_env_vars:
+        env.update(proxy_env_vars)
+        if sandbox_config is not None:
+            sandbox_config.env_vars.update(proxy_env_vars)
 
     shell_executable = (
         get_current_shell_command_executable()

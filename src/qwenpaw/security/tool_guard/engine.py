@@ -77,6 +77,8 @@ class ToolGuardEngine:
             self._guardians = self._default_guardians()
 
         self._reload_tool_sets()
+        self._url_net_guard = None
+        self._init_url_net_guard()
 
     # ------------------------------------------------------------------
     # Default guardians
@@ -105,6 +107,58 @@ class ToolGuardEngine:
         except Exception as exc:  # pragma: no cover
             logger.warning(
                 "Failed to initialise ShellEvasionGuardian: %s",
+                exc,
+            )
+        # URL Guard — URL 安全拦截 Guardian
+        try:
+            from .guardians.url_guardian import URLToolGuardian
+            from .url_guard.url_rule_engine import URLRuleEngine
+
+            # URL Guard 启用判断：env var > config.json > default (True)
+            env_val = EnvVarLoader.get_str("QWENPAW_URL_GUARD_ENABLED") or None
+            url_enabled: bool | None = None
+            if env_val is not None:
+                url_enabled = env_val.lower() in _TRUE_STRINGS
+
+            if url_enabled is None:
+                try:
+                    from qwenpaw.config import load_config
+                    url_enabled = load_config().security.url_guard.enabled
+                except Exception:
+                    url_enabled = True
+
+            if url_enabled:
+                try:
+                    from qwenpaw.config import load_config
+                    url_cfg = load_config().security.url_guard
+                    rule_engine = URLRuleEngine(
+                        blocked_domains=url_cfg.blocked_domains,
+                        blocked_patterns=url_cfg.blocked_patterns,
+                        allowed_domains=url_cfg.allowed_domains,
+                    )
+                    # 加载自定义规则
+                    from .url_guard.url_rule_engine import URLRule
+                    for cr in url_cfg.custom_rules:
+                        rule = URLRule(
+                            id=cr.get("id", f"URL_CUSTOM_{len(url_cfg.custom_rules)}"),
+                            category=cr.get("category", "network_abuse"),
+                            severity=cr.get("severity", "HIGH"),
+                            blocked_domains=cr.get("blocked_domains", []),
+                            blocked_patterns=cr.get("blocked_patterns", []),
+                            description=cr.get("description", ""),
+                            remediation=cr.get("remediation", ""),
+                            allowed_domains=cr.get("allowed_domains", []),
+                        )
+                        rule_engine.add_rule(rule)
+                    guardians.append(URLToolGuardian(rule_engine=rule_engine))
+                except Exception:
+                    # 配置加载失败时用默认配置
+                    guardians.append(URLToolGuardian(rule_engine=URLRuleEngine()))
+            else:
+                logger.info("URL Guard disabled, skipping URLToolGuardian")
+        except Exception as exc:  # pragma: no cover
+            logger.warning(
+                "Failed to initialise URLToolGuardian: %s",
                 exc,
             )
         return guardians
@@ -162,6 +216,21 @@ class ToolGuardEngine:
         self._guarded_tools: set[str] | None = resolve_guarded_tools()
         self._denied_tools: set[str] = resolve_denied_tools()
         self._auto_denied_rules: set[str] = resolve_auto_denied_rules()
+
+    def _init_url_net_guard(self) -> None:
+        """Auto-install URLNetGuard if URLToolGuardian is registered.
+
+        This ensures the HTTP monkey-patch layer (Layer 2 of URL defense)
+        is activated automatically when the ToolGuardEngine is initialized,
+        sharing the same URLRuleEngine instance as URLToolGuardian.
+        """
+        try:
+            from .url_guard.integration import setup_url_net_guard_from_engine
+
+            self._url_net_guard = setup_url_net_guard_from_engine(self)
+        except Exception:
+            logger.debug("URLNetGuard auto-install skipped (may not be needed)")
+            self._url_net_guard = None
 
     def reload_rules(self) -> None:
         """Reload guardian rules and refresh guarded/denied tool sets."""
