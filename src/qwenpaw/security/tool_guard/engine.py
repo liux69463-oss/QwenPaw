@@ -26,6 +26,7 @@ from .guardians import BaseToolGuardian
 from .guardians.file_guardian import FilePathToolGuardian
 from .guardians.rule_guardian import RuleBasedToolGuardian
 from .guardians.shell_evasion_guardian import ShellEvasionGuardian
+from .url_guard import UrlGuardian
 from .models import ToolGuardResult
 
 logger = logging.getLogger(__name__)
@@ -105,6 +106,13 @@ class ToolGuardEngine:
         except Exception as exc:  # pragma: no cover
             logger.warning(
                 "Failed to initialise ShellEvasionGuardian: %s",
+                exc,
+            )
+        try:
+            guardians.append(UrlGuardian())
+        except Exception as exc:  # pragma: no cover
+            logger.warning(
+                "Failed to initialise UrlGuardian: %s",
                 exc,
             )
         return guardians

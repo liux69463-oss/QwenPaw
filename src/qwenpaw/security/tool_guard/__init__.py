@@ -44,6 +44,7 @@ from .engine import ToolGuardEngine
 from .guardians import BaseToolGuardian
 from .guardians.file_guardian import FilePathToolGuardian
 from .guardians.rule_guardian import RuleBasedToolGuardian
+from .url_guard import UrlGuardian
 
 __all__ = [
     "TOOL_GUARD_DENIED_MARK",
@@ -53,6 +54,7 @@ __all__ = [
     "BaseToolGuardian",
     "FilePathToolGuardian",
     "RuleBasedToolGuardian",
+    "UrlGuardian",
     "ToolGuardEngine",
     "ToolGuardResult",
 ]

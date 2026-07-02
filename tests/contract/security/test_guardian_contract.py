@@ -23,6 +23,7 @@ from qwenpaw.security.tool_guard.guardians.file_guardian import (
 from qwenpaw.security.tool_guard.guardians.rule_guardian import (
     RuleBasedToolGuardian,
 )
+from qwenpaw.security.tool_guard.url_guard import UrlGuardian
 from qwenpaw.security.tool_guard.models import GuardFinding
 
 
@@ -65,6 +66,19 @@ def rule_guardian():
         return RuleBasedToolGuardian()
 
 
+@pytest.fixture
+def url_guardian():
+    """Create a UrlGuardian with empty config for contract testing."""
+    with patch(
+        "qwenpaw.security.tool_guard.url_guard._is_url_guard_enabled",
+        return_value=True,
+    ), patch(
+        "qwenpaw.security.tool_guard.url_guard._load_url_guard_config",
+        return_value=([], [], []),
+    ):
+        return UrlGuardian(enabled=True)
+
+
 # ---------------------------------------------------------------------------
 # Contract: guard() returns list[GuardFinding]
 # ---------------------------------------------------------------------------
@@ -83,6 +97,14 @@ class TestGuardReturnsList:
         result = rule_guardian.guard(
             "execute_shell_command",
             {"command": "echo hello"},
+        )
+        assert isinstance(result, list)
+
+    def test_url_guardian_returns_list(self, url_guardian):
+        """UrlGuardian.guard() returns list."""
+        result = url_guardian.guard(
+            "execute_shell_command",
+            {"command": "curl http://127.0.0.1/test"},
         )
         assert isinstance(result, list)
 
@@ -107,6 +129,15 @@ class TestGuardReturnsList:
         result = rule_guardian.guard(
             "execute_shell_command",
             {"command": "echo hello"},
+        )
+        for item in result:
+            assert isinstance(item, GuardFinding)
+
+    def test_url_guardian_findings_are_guard_finding(self, url_guardian):
+        """All items in the result must be GuardFinding instances."""
+        result = url_guardian.guard(
+            "execute_shell_command",
+            {"command": "curl http://127.0.0.1/test"},
         )
         for item in result:
             assert isinstance(item, GuardFinding)
@@ -146,6 +177,19 @@ class TestUnknownToolNoCrash:
         result = rule_guardian.guard("", {"command": "echo hello"})
         assert isinstance(result, list)
 
+    def test_url_guardian_unknown_tool(self, url_guardian):
+        """UrlGuardian handles unknown tool gracefully."""
+        result = url_guardian.guard(
+            "nonexistent_tool_xyz",
+            {"data": "http://127.0.0.1/test"},
+        )
+        assert isinstance(result, list)
+
+    def test_url_guardian_empty_tool_name(self, url_guardian):
+        """UrlGuardian handles empty tool name."""
+        result = url_guardian.guard("", {"command": "curl http://127.0.0.1/test"})
+        assert isinstance(result, list)
+
 
 # ---------------------------------------------------------------------------
 # Contract: empty params are handled gracefully
@@ -173,6 +217,19 @@ class TestEmptyParamsNoCrash:
     def test_rule_guardian_none_param_value(self, rule_guardian):
         """RuleBasedToolGuardian handles None param values."""
         result = rule_guardian.guard(
+            "execute_shell_command",
+            {"command": None},
+        )
+        assert isinstance(result, list)
+
+    def test_url_guardian_empty_params(self, url_guardian):
+        """UrlGuardian handles empty params."""
+        result = url_guardian.guard("execute_shell_command", {})
+        assert isinstance(result, list)
+
+    def test_url_guardian_none_param_value(self, url_guardian):
+        """UrlGuardian handles None param values."""
+        result = url_guardian.guard(
             "execute_shell_command",
             {"command": None},
         )

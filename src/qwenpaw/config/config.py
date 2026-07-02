@@ -1736,6 +1736,20 @@ class FileGuardConfig(BaseModel):
     allow_preview_outside_workspace: bool = True
 
 
+class UrlGuardConfig(BaseModel):
+    """URL guard settings under ``security.url_guard``.
+
+    ``blocked_urls``: URL patterns to block (supports globs like ``*evil.com*``).
+    ``allowed_urls``: Whitelist patterns that override the blocklist.
+    ``blocked_ip_ranges``: CIDR ranges to treat as blocked (e.g. ``10.0.0.0/8``).
+    """
+
+    enabled: bool = True
+    blocked_urls: List[str] = Field(default_factory=list)
+    allowed_urls: List[str] = Field(default_factory=list)
+    blocked_ip_ranges: List[str] = Field(default_factory=list)
+
+
 class SkillScannerWhitelistEntry(BaseModel):
     """A whitelisted skill (identified by name + content hash)."""
 
@@ -1781,6 +1795,7 @@ class SecurityConfig(BaseModel):
 
     tool_guard: ToolGuardConfig = Field(default_factory=ToolGuardConfig)
     file_guard: FileGuardConfig = Field(default_factory=FileGuardConfig)
+    url_guard: UrlGuardConfig = Field(default_factory=UrlGuardConfig)
     skill_scanner: SkillScannerConfig = Field(
         default_factory=SkillScannerConfig,
     )
