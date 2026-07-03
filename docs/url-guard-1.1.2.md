@@ -57,8 +57,7 @@ Agent 发起工具调用
 
 白名单优先级高于所有其他检查。如果 URL 命中白名单，直接放行，不触发任何其他检查。
 
-```bash
-# config.json 示例
+```json
 {
   "security": {
     "url_guard": {
