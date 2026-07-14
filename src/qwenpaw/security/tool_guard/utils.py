@@ -153,7 +153,13 @@ def resolve_auto_denied_rules(
     if cfg is not None and cfg.auto_denied_rules:
         return {r.strip() for r in cfg.auto_denied_rules if r.strip()}
 
-    return set()
+    # Built-in rules that auto-deny without offering user approval.
+    return {
+        "URL_BLOCKLIST_HOST",
+        "URL_BLOCKLIST_URL",
+        "URL_LOOPBACK",
+        "SHELL_EVASION_URL_VARIABLE_HOST",
+    }
 
 
 def log_findings(tool_name: str, result: "ToolGuardResult") -> None:

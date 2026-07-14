@@ -53,6 +53,15 @@ _ANSI_C_QUOTE_RE = re.compile(r"\$'[^']*'")
 _LOCALE_QUOTE_RE = re.compile(r'\$"[^"]*"')
 _EMPTY_SPECIAL_QUOTE_DASH_RE = re.compile(r"\$['\"]{2}\s*-")
 _EMPTY_QUOTE_DASH_RE = re.compile(r"(?:^|\s)(?:''|\"\")+\s*-")
+
+# URL whose hostname portion relies on shell variable expansion (e.g.
+# ``curl https://www.$d/`` or ``curl https://${TARGET}/api``).  The
+# static URL blocklist sees the literal ``$d`` / ``${TARGET}`` and
+# cannot know what the actual resolved hostname will be at runtime.
+_URL_VAR_HOST_RE = re.compile(
+    r"https?://[^\s]*\$[\w{}]+",
+    re.IGNORECASE,
+)
 # =====================================================================
 # Quote-state tracker
 # =====================================================================
@@ -453,6 +462,28 @@ def _check_quoted_newline(command: str) -> GuardFinding | None:
     return None
 
 
+def _check_url_variable_host(command: str) -> GuardFinding | None:
+    """Detect URLs whose hostname uses shell variable expansion.
+
+    ``curl https://www.$d/`` resolves ``$d`` at runtime (e.g. to
+    ``csdn.net``), but the static URL blocklist only sees the literal
+    ``$d`` and cannot match ``*csdn.net*``.  Flagging the command
+    closes this bypass vector.
+    """
+    for m in _URL_VAR_HOST_RE.finditer(command):
+        return _finding(
+            "SHELL_EVASION_URL_VARIABLE_HOST",
+            GuardSeverity.HIGH,
+            "命令中的 URL 使用 shell 变量拼接 hostname"
+            " ($var / ${var})，可能用于绕过 URL 黑名单静态检查",
+            command,
+            risk_type="url_variable_host",
+            matched=m.group(0),
+            snippet=m.group(0),
+        )
+    return None
+
+
 # =====================================================================
 # Finding factory
 # =====================================================================
@@ -510,6 +541,7 @@ _CHECKS: tuple[tuple[str, _ShellCheckFn], ...] = (
     ("newlines", _check_newlines),
     ("comment_quote_desync", _check_comment_quote_desync),
     ("quoted_newline", _check_quoted_newline),
+    ("url_variable_host", _check_url_variable_host),
 )
 _CHECK_NAMES: frozenset[str] = frozenset(name for name, _ in _CHECKS)
 

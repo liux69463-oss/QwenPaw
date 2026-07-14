@@ -345,31 +345,46 @@ class TestResolveAutoDeniedRules:
         mock_env_loader,
         mock_config,
     ):
-        """Falsy config.auto_denied_rules falls through to default empty."""
+        """Falsy config.auto_denied_rules falls through to built-in default."""
         mock_env_loader.return_value = ""
         mock_config.return_value.security.tool_guard.auto_denied_rules = []
         result = resolve_auto_denied_rules()
-        assert result == set()
+        assert result == {
+            "URL_BLOCKLIST_HOST",
+            "URL_BLOCKLIST_URL",
+            "URL_LOOPBACK",
+            "SHELL_EVASION_URL_VARIABLE_HOST",
+        }
 
-    def test_default_is_empty_set(
+    def test_default_is_builtin_set(
         self,
         mock_env_loader,
         mock_config,  # pylint: disable=unused-argument
     ):
-        """With nothing specified anywhere the default is an empty set."""
+        """With nothing specified anywhere the built-in default is used."""
         mock_env_loader.return_value = ""
         result = resolve_auto_denied_rules()
-        assert result == set()
+        assert result == {
+            "URL_BLOCKLIST_HOST",
+            "URL_BLOCKLIST_URL",
+            "URL_LOOPBACK",
+            "SHELL_EVASION_URL_VARIABLE_HOST",
+        }
 
     def test_config_load_failure_falls_to_default(self, mock_env_loader):
-        """If config loading raises, fall through to default empty set."""
+        """If config loading raises, fall through to built-in default."""
         mock_env_loader.return_value = ""
         with patch(
             "qwenpaw.security.tool_guard.utils._load_config_tool_guard",
             return_value=None,
         ):
             result = resolve_auto_denied_rules()
-        assert result == set()
+        assert result == {
+            "URL_BLOCKLIST_HOST",
+            "URL_BLOCKLIST_URL",
+            "URL_LOOPBACK",
+            "SHELL_EVASION_URL_VARIABLE_HOST",
+        }
 
 
 # ---------------------------------------------------------------------------

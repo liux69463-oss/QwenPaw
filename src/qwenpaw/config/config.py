@@ -1739,12 +1739,18 @@ class FileGuardConfig(BaseModel):
 class UrlGuardConfig(BaseModel):
     """URL guard settings under ``security.url_guard``.
 
-    ``blocked_urls``: URL patterns to block (supports globs like ``*evil.com*``).
-    ``allowed_urls``: Whitelist patterns that override the blocklist.
+    ``blocked_hostnames``: hostname-level patterns to block the whole domain
+        and its subdomains (e.g. ``*csdn.net*``). Matched against the URL's
+        hostname only.
+    ``blocked_urls``: full-URL / endpoint-level patterns to block specific
+        paths (e.g. ``https://csdn.net/article/123*``). Matched against the
+        entire URL.
+    ``allowed_urls``: Whitelist patterns that override both blocklists.
     ``blocked_ip_ranges``: CIDR ranges to treat as blocked (e.g. ``10.0.0.0/8``).
     """
 
     enabled: bool = True
+    blocked_hostnames: List[str] = Field(default_factory=list)
     blocked_urls: List[str] = Field(default_factory=list)
     allowed_urls: List[str] = Field(default_factory=list)
     blocked_ip_ranges: List[str] = Field(default_factory=list)
